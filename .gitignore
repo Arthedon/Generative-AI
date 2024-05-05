@@ -1,7 +1,13 @@
 # Byte-compiled / optimized / DLL files
-__pycache__/
+*/__pycache__/
 *.py[cod]
 *$py.class
+
+# Folders to ignore
+*/runs/
+*/data/
+data/
+weights/
 
 # C extensions
 *.so
