@@ -1,9 +1,11 @@
-from network.GAN import GAN
+from network.WGAN import WGAN
 
 def main():
-    architecture = {"Discriminator": {"numClasses": 1, "channels": [16, 64, 256, 1024, 2048]}, "Generator": {"latentSpaceSize": 100, "channels":[4096, 1024, 512, 256, 128]}}
-    network = GAN(imageShape = (128, 128, 3), architecture = architecture)
-    network.train_gan(numEpochs = 75, learningRate = 2e-5, batchSize = 128, continueTraining = False)
+    configuration = {"Discriminator": {"channels": [16, 64, 128, 256, 512, 2048]},
+                    "Generator": {"latentSpaceSize": 100, "channels": [4096, 1024, 512, 256, 128]},
+                    "Training": {"extraSteps": 5, "penaltyRatio": 10, "minLearningRate": 1e-7}}
+    network = WGAN(imageShape = (128, 128, 3), configuration = configuration)
+    network.train_gan(numEpochs = 35, learningRate = 1e-4, batchSize = 128, continueTraining = True)
 
 if __name__ == "__main__":
     main()

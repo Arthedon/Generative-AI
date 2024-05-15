@@ -5,7 +5,9 @@ from torchvision import datasets as ds
 from torch.utils.data import DataLoader
 from torch import optim
 
+from loss.WGAN import WassersteinDiscriminatorLoss, WassersteinGeneratorLoss
 from utils.logger import Logger
+from utils.training_utils import LRScheduler
 import os
 from tqdm.auto import tqdm
 
@@ -15,12 +17,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Working with {device}...")
 torch.set_default_device(device)
 
-class GANDiscriminator(nn.Module):
-    def __init__(self, imageShape: tuple = (512, 288, 3), configuration: dict = {"numClasses": 1, "channels": [16, 64, 256]}) -> None:
+class WGANDiscriminator(nn.Module):
+    def __init__(self, imageShape: tuple = (128, 128, 3), configuration: dict = {"channels": [16, 64, 256]}) -> None:
         super().__init__()
-        self.inputChannel = imageShape[0] * imageShape[1]
-        self.outputFeatures = configuration["numClasses"]
-
+        height, width = imageShape[0], imageShape[1]
+        inputFeaturesSize = imageShape[0] * imageShape[1]
         self.convolutionalLayers = nn.Sequential()
         inputChannel = imageShape[2]
         for idx, outputChannel in enumerate(configuration["channels"]):
@@ -28,27 +29,27 @@ class GANDiscriminator(nn.Module):
                                                         kernel_size = 3,
                                                         stride = 2, 
                                                         padding = 1, device = device))
+            height //= 2
+            width //= 2
+            inputFeaturesSize /= 4
             if idx != 0:
-                self.convolutionalLayers.append(nn.BatchNorm2d(outputChannel, device = device))
+                self.convolutionalLayers.append(nn.LayerNorm(normalized_shape = [outputChannel, height, width], device = device))
             self.convolutionalLayers.append(nn.LeakyReLU(0.2, inplace = True))
             self.convolutionalLayers.append(nn.Dropout(0.3))
             inputChannel = outputChannel
 
-        self.linearLayers = nn.Sequential()
-        self.linearLayers.append(nn.Linear(in_features = int(self.inputChannel / (4 ** len(configuration["channels"])) * outputChannel), out_features = 1024,
-                                           device = device))
-        self.linearLayers.append(nn.Linear(in_features = 1024, out_features = self.outputFeatures, device = device))
-        self.linearLayers.append(nn.Sigmoid())
+        inputFeaturesSize *= outputChannel
+        self.output = nn.Sequential(
+            nn.Conv2d(in_channels = inputChannel, out_channels = 1, kernel_size = 3, stride = 2, padding = 1)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.convolutionalLayers(x)
-        x = x.view(x.size(0), -1)
-        x = self.linearLayers(x)
-
+        x = self.output(x)
         return x
 
-class GANGenerator(nn.Module):
-    def __init__(self, imageShape: tuple = (512, 288, 3), configuration: dict = {"latentSpaceSize": 100, "channels": [1024, 512, 256, 128]}) -> None:
+class WGANGenerator(nn.Module):
+    def __init__(self, imageShape: tuple = (128, 128, 3), configuration: dict = {"latentSpaceSize": 100, "channels": [1024, 512, 256, 128]}) -> None:
         super().__init__()
         self.inputChannel = configuration["latentSpaceSize"]
         self.outputFeatures = imageShape[0] * imageShape[1] * imageShape[2]
@@ -83,22 +84,24 @@ class GANGenerator(nn.Module):
                                                         padding = 1, device = device))
         self.convolutionalLayers.append(nn.Tanh())
 
-
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.convolutionalLayers(x)
-
         return x
     
-class GAN():
-    def __init__(self, imageShape: tuple, configuration: dict = {"Discriminator": {"numClasses": 1, "channels": [16, 64, 256]},
-                                                                  "Generator": {"latentSpaceSize": 100, "channels": [1024, 512, 256, 128]}}) -> None:
-        super().__init__()
+class WGAN():
+    def __init__(self, imageShape: tuple,
+                 configuration: dict = {"Discriminator": {"channels": [16, 64, 256]},
+                                        "Generator": {"latentSpaceSize": 100, "channels": [1024, 512, 256, 128]},
+                                        "Training": {"extraSteps": 5, "penaltyRatio": 10}}) -> None:
+        super(WGAN, self).__init__()
         self.imageShape = imageShape
         self.configuration = configuration
-        self.discriminatorNet = GANDiscriminator(self.imageShape, self.configuration["Discriminator"])
-        self.generatorNet = GANGenerator(self.imageShape, self.configuration["Generator"])
-        self.lossCriterion = nn.BCELoss()
+        self.discriminatorNet = WGANDiscriminator(self.imageShape, self.configuration["Discriminator"])
+        self.generatorNet = WGANGenerator(self.imageShape, self.configuration["Generator"])
+        self.discriminatorLossCriterion = WassersteinDiscriminatorLoss()
+        self.generatorLossCriterion = WassersteinGeneratorLoss()
+        self.penaltyRatio = configuration["Training"]["penaltyRatio"]
+        self.extraSteps = configuration["Training"]["extraSteps"]
 
     def sample(self, sampleSize: int) -> torch.Tensor:
         z = torch.randn(size = (sampleSize, self.configuration["Generator"]["latentSpaceSize"], 1, 1)).to(device)
@@ -112,58 +115,62 @@ class GAN():
     def discriminator_forward(self, images: torch.Tensor) -> torch.Tensor:
         x = self.discriminatorNet(images)
         return x
-        
-    def train_discriminator(self, optimizer, realData):
-        # Train with real batch
+    
+    def merge_images(self, images: torch.Tensor, batchSize: int):
+        fakeImages = self.generator_forward(batchSize)
+        alpha = torch.rand((batchSize, 1, 1, 1)).half().to(device)
+        meanImages = alpha * images + (1 - alpha) * fakeImages
+        yPred = self.discriminator_forward(meanImages).squeeze()
+        return meanImages, yPred
+
+    def gradient_penalty(self, meanImages: torch.Tensor, yPred: torch.Tensor):
+        ones = torch.ones_like(yPred)
+        gradParameters = torch.autograd.grad(outputs = yPred, inputs = meanImages, create_graph = True, grad_outputs = ones)[0]
+        gradParameters = gradParameters.reshape(gradParameters.shape[0], -1)
+        gradientNorm = gradParameters.norm(2, dim = 1)
+        gradientPenalty = torch.mean((gradientNorm - 1) ** 2)
+        return gradientPenalty
+
+    def train_discriminator(self, optimizer, realData: torch.Tensor):
         self.discriminatorNet.zero_grad()
-
+        
         batchSize = realData.size(0)
-        label = torch.full((batchSize,), 1, dtype = torch.float, device = device)
-
-        predictions = self.discriminatorNet(realData).view(-1)
-
-        errorRealData = self.lossCriterion(predictions, label)
-
-        errorRealData.backward()
-        batchAccuracy = predictions.mean().item()
-
-        # Train with fake batch        
         noise = self.sample(batchSize)
-
         fakeData = self.generatorNet(noise)
-        label.fill_(0)
 
-        predictions = self.discriminatorNet(fakeData.detach()).view(-1)
+        criticsRealData = self.discriminatorNet(realData).view(-1)
+        criticsFakeData = self.discriminatorNet(fakeData.detach()).view(-1)
+        
+        batchLoss = self.discriminatorLossCriterion(criticsRealData, criticsFakeData)
+        mergedImages, yPred = self.merge_images(realData, batchSize)
+        lossPenalty = self.gradient_penalty(mergedImages, yPred)
+        totalBatchLoss = batchLoss + lossPenalty * self.penaltyRatio
 
-        errorFakeData = self.lossCriterion(predictions, label)
-
-        errorFakeData.backward()
-        batchLoss = errorRealData + errorFakeData
+        totalBatchLoss.backward()
         optimizer.step()
         
-        return batchLoss, batchAccuracy, fakeData
+        return batchLoss
         
-    def train_generator(self, optimizer, fakeData):
+    def train_generator(self, optimizer, batchSize: int):
         self.generatorNet.train()
-
         self.generatorNet.zero_grad()
-        label = torch.full((fakeData.size(0),), 1, dtype = torch.float, device = device)
 
-        predictions = self.discriminatorNet(fakeData).view(-1)
+        noise = self.sample(batchSize)
+        fakeData = self.generatorNet(noise)
         
-        batchLoss = self.lossCriterion(predictions, label)
-        batchLoss.backward()
-        batchAccuracy = predictions.mean().item()
+        criticsFakeData = self.discriminatorNet(fakeData).view(-1)        
+        batchLoss = self.generatorLossCriterion(criticsFakeData)
 
+        batchLoss.backward()
         optimizer.step()
         
-        return (batchLoss, batchAccuracy)
+        return batchLoss
     
     def train_gan(self, numEpochs = 1e2, learningRate = 2e-4, optimizer: tuple = None, batchSize = 64, datasetPath: str = "../data/", 
                   continueTraining: bool = False):
         
         progressBar = tqdm(range(int(numEpochs)))
-        logger = Logger(model_name = 'GAN', data_name = 'DOGS')
+        logger = Logger(model_name = 'WGAN', data_name = 'DOGS')
 
         preprocessing = transforms.Compose([
                                transforms.Resize(self.imageShape[0]),
@@ -180,49 +187,56 @@ class GAN():
         trainLoader = DataLoader(trainDataset, batch_size = batchSize,
                                  shuffle = True, generator = torch.Generator(device))
 
-        weightsDirectoryPath = "../weights/GAN/"
+        weightsDirectoryPath = "../weights/WGAN/"
         GeneratorPath, DiscriminatorPath = "generator/", "discriminator/"
         bestWeightsPath = "best_model_weights"
         modelWeightsPath = "GAN_weights_"
         finalWeightsPath = "final_weights"
         weightsExtension = ".pth"
 
+        if not os.path.isdir(weightsDirectoryPath + GeneratorPath):
+            os.mkdir(weightsDirectoryPath + GeneratorPath)
+        if not os.path.isdir(weightsDirectoryPath + DiscriminatorPath):
+            os.mkdir(weightsDirectoryPath + DiscriminatorPath)
+
+
         if continueTraining:
-            self.discriminatorNet.load_state_dict(torch.load(weightsDirectoryPath + DiscriminatorPath + bestWeightsPath + weightsExtension))
-            self.generatorNet.load_state_dict(torch.load(weightsDirectoryPath + GeneratorPath + bestWeightsPath + weightsExtension))
+            self.discriminatorNet.load_state_dict(torch.load(weightsDirectoryPath + DiscriminatorPath + finalWeightsPath + weightsExtension))
+            self.generatorNet.load_state_dict(torch.load(weightsDirectoryPath + GeneratorPath + finalWeightsPath + weightsExtension))
+        
         if not optimizer:
-            discriminatorOptimizer = optim.Adam(self.discriminatorNet.parameters(), lr = learningRate)
-            generatorOptimizer = optim.Adam(self.generatorNet.parameters(), lr = learningRate)
+            discriminatorOptimizer = optim.Adam(self.discriminatorNet.parameters(), lr = learningRate, betas = (0, 0.9))
+            generatorOptimizer = optim.Adam(self.generatorNet.parameters(), lr = learningRate, betas = (0, 0.9))
         else:
             discriminatorOptimizer, generatorOptimizer = optimizer
 
-        discriminatorTrainingLoss, generatorLoss, generatorAccuracy, discriminatorAccuracy = [], [], [], []
-        bestGeneratorAccuracy = 0.0
+        # self.scheduler = LRScheduler(decayEpochs = 3 * numEpochs // 4,
+        #                              optimizers = (generatorOptimizer, discriminatorOptimizer), 
+        #                              minLearningRate = self.configuration["Training"]["minLearningRate"])
+
+        discriminatorTrainingLoss, generatorTrainingLoss = [], []
 
         noise = self.sample(16)
-
+        bestGeneratorLoss = float("inf")
+        os.system('clear')
         for epoch in progressBar:
-            discriminatorBatchLoss, discriminatorBatchAccuracy, generatorBatchLoss, generatorBatchAccuracy = 0.0, 0.0, 0.0, 0.0
-            meanDiscriminatorAccuracy, meanGeneratorAccuracy = 0.0, 0.0
+            discriminatorBatchLoss, generatorBatchLoss, generatorLoss = 0.0, 0.0, 0.0
             for idx, (realData, _) in enumerate(trainLoader):
                 if idx % 10 == 0:
-                    print(f"[{epoch}/{numEpochs}] Batch number {idx}/{int(len(trainDataset) / batchSize)}, Loss {discriminatorBatchLoss:.5f}, " + \
-                          f"{generatorBatchLoss:.5f}, Accuracy: {meanDiscriminatorAccuracy / (idx + 1):.2f}, {meanGeneratorAccuracy / (idx + 1):.2f}",
-                          end = '\r')
-                discriminatorBatchLoss, discriminatorBatchAccuracy, fakeData = self.train_discriminator(discriminatorOptimizer, 
-                                                                                                        realData)
-                meanDiscriminatorAccuracy += discriminatorBatchAccuracy
+                    print(f"[{epoch}/{numEpochs}] Batch number {idx}/{int(len(trainDataset) / batchSize)}, Loss - discriminator: " + \
+                          f"{discriminatorBatchLoss:.5f}, generator: {generatorBatchLoss:.5f}", end = '\r')
 
-                loss, accuracy = self.train_generator(generatorOptimizer,
-                                                      fakeData)
-                generatorBatchLoss = loss
-                generatorBatchAccuracy = accuracy
+                for _ in range(self.extraSteps):
+                    imageNoise = torch.randn_like(realData) * 0.1
+                    realData += imageNoise
+                    realData = torch.clamp(realData, 0, 1)
+                    discriminatorBatchLoss = self.train_discriminator(discriminatorOptimizer, realData)
 
-                meanGeneratorAccuracy += generatorBatchAccuracy
-
+                generatorBatchLoss = self.train_generator(generatorOptimizer, batchSize)
+                generatorLoss += generatorBatchLoss
+                
+                generatorTrainingLoss.append(generatorBatchLoss)
                 discriminatorTrainingLoss.append(discriminatorBatchLoss)
-                generatorLoss.append(generatorBatchLoss)
-                generatorAccuracy.append(generatorBatchAccuracy)
                 
                 if idx % 500 == 0:
                     testImages = self.generatorNet(noise).detach().cpu()
@@ -231,21 +245,22 @@ class GAN():
                         epoch, idx, len(trainLoader)
                     )
             
-            if generatorBatchAccuracy > bestGeneratorAccuracy:
-                bestGeneratorAccuracy = generatorBatchAccuracy
+            # self.scheduler.step(epoch)
+
+            if generatorLoss < bestGeneratorLoss:
+                bestGeneratorLoss = generatorLoss
                 torch.save(self.generatorNet.state_dict(), weightsDirectoryPath + GeneratorPath + bestWeightsPath + weightsExtension)
                 torch.save(self.discriminatorNet.state_dict(), weightsDirectoryPath + DiscriminatorPath + bestWeightsPath + weightsExtension)
 
-            if epoch % 5 == 0:
+            if epoch % 10 == 0:
                 torch.save(self.discriminatorNet.state_dict(), weightsDirectoryPath + DiscriminatorPath + modelWeightsPath + str(epoch) + weightsExtension)
                 torch.save(self.generatorNet.state_dict(), weightsDirectoryPath + GeneratorPath + modelWeightsPath + str(epoch) + weightsExtension)
 
             os.system('clear')
 
-            progressBar.set_description(f'Discriminator Loss: {discriminatorBatchLoss:.3e}, Generator Loss: {generatorBatchLoss:.3e}, ' + \
-                                        f'Discriminator Accuracy: {discriminatorBatchAccuracy:.2f}, Generator Accuracy: {generatorBatchAccuracy:.2f}')
+            progressBar.set_description(f'Discriminator Loss: {discriminatorBatchLoss:.3e}, Generator Loss: {generatorBatchLoss:.3e}')
 
         torch.save(self.discriminatorNet.state_dict(), weightsDirectoryPath + DiscriminatorPath + finalWeightsPath + weightsExtension)
         torch.save(self.generatorNet.state_dict(), weightsDirectoryPath + GeneratorPath + finalWeightsPath + weightsExtension)
 
-        return discriminatorTrainingLoss, discriminatorAccuracy, generatorLoss, generatorAccuracy
+        return discriminatorTrainingLoss, generatorTrainingLoss
