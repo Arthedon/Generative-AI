@@ -16,92 +16,92 @@ print(f"Working with {device}...")
 torch.set_default_device(device)
 
 class GANDiscriminator(nn.Module):
-    def __init__(self, imageShape: tuple = (512, 288, 3), architecture: dict = {"numClasses": 1, "channels": [16, 64, 256]}) -> None:
+    def __init__(self, imageShape: tuple = (512, 288, 3), configuration: dict = {"numClasses": 1, "channels": [16, 64, 256]}) -> None:
         super().__init__()
         self.inputChannel = imageShape[0] * imageShape[1]
-        self.outputFeatures = architecture["numClasses"]
+        self.outputFeatures = configuration["numClasses"]
 
-        self.convolutionnalLayers = nn.Sequential()
+        self.convolutionalLayers = nn.Sequential()
         inputChannel = imageShape[2]
-        for idx, outputChannel in enumerate(architecture["channels"]):
-            self.convolutionnalLayers.append(nn.Conv2d(in_channels = inputChannel, out_channels = outputChannel, 
+        for idx, outputChannel in enumerate(configuration["channels"]):
+            self.convolutionalLayers.append(nn.Conv2d(in_channels = inputChannel, out_channels = outputChannel, 
                                                         kernel_size = 3,
                                                         stride = 2, 
                                                         padding = 1, device = device))
             if idx != 0:
-                self.convolutionnalLayers.append(nn.BatchNorm2d(outputChannel, device = device))
-            self.convolutionnalLayers.append(nn.LeakyReLU(0.2, inplace = True))
-            self.convolutionnalLayers.append(nn.Dropout(0.3))
+                self.convolutionalLayers.append(nn.BatchNorm2d(outputChannel, device = device))
+            self.convolutionalLayers.append(nn.LeakyReLU(0.2, inplace = True))
+            self.convolutionalLayers.append(nn.Dropout(0.3))
             inputChannel = outputChannel
 
         self.linearLayers = nn.Sequential()
-        self.linearLayers.append(nn.Linear(in_features = int(self.inputChannel / (4 ** len(architecture["channels"])) * outputChannel), out_features = 1024,
+        self.linearLayers.append(nn.Linear(in_features = int(self.inputChannel / (4 ** len(configuration["channels"])) * outputChannel), out_features = 1024,
                                            device = device))
         self.linearLayers.append(nn.Linear(in_features = 1024, out_features = self.outputFeatures, device = device))
         self.linearLayers.append(nn.Sigmoid())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.convolutionnalLayers(x)
+        x = self.convolutionalLayers(x)
         x = x.view(x.size(0), -1)
         x = self.linearLayers(x)
 
         return x
 
 class GANGenerator(nn.Module):
-    def __init__(self, imageShape: tuple = (512, 288, 3), architecture: dict = {"latentSpaceSize": 100, "channels": [1024, 512, 256, 128]}) -> None:
+    def __init__(self, imageShape: tuple = (512, 288, 3), configuration: dict = {"latentSpaceSize": 100, "channels": [1024, 512, 256, 128]}) -> None:
         super().__init__()
-        self.inputChannel = architecture["latentSpaceSize"]
+        self.inputChannel = configuration["latentSpaceSize"]
         self.outputFeatures = imageShape[0] * imageShape[1] * imageShape[2]
         self.imageShape = imageShape
 
-        self.architecture = architecture
+        self.configuration = configuration
 
-        self.convolutionnalLayers = nn.Sequential()
+        self.convolutionalLayers = nn.Sequential()
 
         inputChannel = self.inputChannel
-        for idx, outputChannel in enumerate(architecture["channels"]):
+        for idx, outputChannel in enumerate(configuration["channels"]):
             if idx == 0:
-                self.convolutionnalLayers.append(nn.ConvTranspose2d(in_channels = inputChannel, out_channels = outputChannel,
+                self.convolutionalLayers.append(nn.ConvTranspose2d(in_channels = inputChannel, out_channels = outputChannel,
                                                                 kernel_size = 4,
                                                                 stride = 1,
                                                                 padding = 0, device = device))
-                self.convolutionnalLayers.append(nn.BatchNorm2d(outputChannel).to(device))
-                self.convolutionnalLayers.append(nn.ReLU(True))
+                self.convolutionalLayers.append(nn.BatchNorm2d(outputChannel).to(device))
+                self.convolutionalLayers.append(nn.ReLU(True))
                 inputChannel = outputChannel
             else:
-                self.convolutionnalLayers.append(nn.ConvTranspose2d(in_channels = inputChannel, out_channels = outputChannel,
+                self.convolutionalLayers.append(nn.ConvTranspose2d(in_channels = inputChannel, out_channels = outputChannel,
                                                                 kernel_size = 4,
                                                                 stride = 2,
                                                                 padding = 1, device = device))
-                self.convolutionnalLayers.append(nn.BatchNorm2d(outputChannel).to(device))
-                self.convolutionnalLayers.append(nn.ReLU(True))
+                self.convolutionalLayers.append(nn.BatchNorm2d(outputChannel).to(device))
+                self.convolutionalLayers.append(nn.ReLU(True))
                 inputChannel = outputChannel
 
-        self.convolutionnalLayers.append(nn.ConvTranspose2d(in_channels = inputChannel, out_channels = 3,
+        self.convolutionalLayers.append(nn.ConvTranspose2d(in_channels = inputChannel, out_channels = 3,
                                                         kernel_size = 4,
                                                         stride = 2,
                                                         padding = 1, device = device))
-        self.convolutionnalLayers.append(nn.Tanh())
+        self.convolutionalLayers.append(nn.Tanh())
 
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.convolutionnalLayers(x)
+        x = self.convolutionalLayers(x)
 
         return x
     
 class GAN():
-    def __init__(self, imageShape: tuple, architecture: dict = {"Discriminator": {"numClasses": 1, "channels": [16, 64, 256]},
+    def __init__(self, imageShape: tuple, configuration: dict = {"Discriminator": {"numClasses": 1, "channels": [16, 64, 256]},
                                                                   "Generator": {"latentSpaceSize": 100, "channels": [1024, 512, 256, 128]}}) -> None:
         super().__init__()
         self.imageShape = imageShape
-        self.architecture = architecture
-        self.discriminatorNet = GANDiscriminator(self.imageShape, self.architecture["Discriminator"])
-        self.generatorNet = GANGenerator(self.imageShape, self.architecture["Generator"])
+        self.configuration = configuration
+        self.discriminatorNet = GANDiscriminator(self.imageShape, self.configuration["Discriminator"])
+        self.generatorNet = GANGenerator(self.imageShape, self.configuration["Generator"])
         self.lossCriterion = nn.BCELoss()
 
     def sample(self, sampleSize: int) -> torch.Tensor:
-        z = torch.randn(size = (sampleSize, self.architecture["Generator"]["latentSpaceSize"], 1, 1)).to(device)
+        z = torch.randn(size = (sampleSize, self.configuration["Generator"]["latentSpaceSize"], 1, 1)).to(device)
         return z
     
     def generator_forward(self, sampleSize: int) -> torch.Tensor:
